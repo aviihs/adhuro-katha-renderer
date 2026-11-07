@@ -1,0 +1,63 @@
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      content_id:
+        description: "Content ID"
+        required: true
+      quote:
+        description: "Nepali quote"
+        required: true
+      caption:
+        description: "Caption"
+        required: false
+        default: ""
+      song:
+        description: "Song suggestion"
+        required: false
+        default: ""
+      background_url:
+        description: "Background video URL"
+        required: true
+      background_page:
+        description: "Background source page"
+        required: false
+        default: ""
+
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg and fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-noto-core libraqm0 libfribidi0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Render and send to Telegram
+        env:
+          # Inputs go through env variables (never pasted into the script).
+          CONTENT_ID: ${{ inputs.content_id }}
+          QUOTE: ${{ inputs.quote }}
+          CAPTION: ${{ inputs.caption }}
+          SONG: ${{ inputs.song }}
+          BACKGROUND_URL: ${{ inputs.background_url }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          RENDER_SECRET: ${{ secrets.RENDER_SECRET }}
+        run: python render.py
