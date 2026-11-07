@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Adhuro Katha renderer.
 
-Background video + Nepali quote -> 1080x1920 mp4 -> Telegram (with approval
-buttons) -> report back to the Apps Script backend.
+Background video + Nepali quote -> 1080x1920 slow-motion mp4 -> Telegram (with
+approval buttons) -> report back to the Apps Script backend.
 
 All settings come from environment variables (set by the GitHub workflow).
 """
@@ -16,18 +16,27 @@ import time
 import traceback
 
 import requests
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
+from PIL import (Image, ImageChops, ImageDraw, ImageFilter, ImageFont,
+                 ImageOps, ImageStat, features)
 
 W, H = 1080, 1920
 FPS = 30
-DURATION = 10  # seconds
+DURATION = 20          # final video length in seconds
+MIN_SLOW = 1.5         # footage is always slowed down at least this much
 WORK = "work"
 HASHTAGS = "#अधुरोकथा #Loneliness #NepaliSadQuotes #DeepFeelings #BrokenHeart"
 UA = {"User-Agent": "Mozilla/5.0 (AdhuroKathaRenderer)"}
 
+# Text look
+FONT_MAX, FONT_MIN = 54, 36   # font size range in px
+TEXT_WIDTH = 860              # max line width in px
+TOP_Y = 0.115                 # text block starts at 11.5% of the height
+MOON = True                   # small crescent after the last line
+MOON_COLOR = (246, 211, 101)
+
 
 # --------------------------------------------------------------------------
-# Text image
+# Text layout and image
 # --------------------------------------------------------------------------
 
 def find_font():
@@ -73,54 +82,127 @@ def wrap_lines(text, font, max_width):
     return lines
 
 
-def make_text_png(quote, out_path):
-    """Draws the quote on a transparent 1080x1920 image."""
+def layout_text(quote):
+    """Chooses font size and line breaks. Prefers 2 lines, at most 3."""
     quote = quote.strip().strip('"“”').strip()
-
     font_path = find_font()
-    max_width = W - 220  # generous side margins
+
+    # Prefer a line break right after the first comma, like a poem:
+    #   "...छैन,"
+    #   "तर मनले ..."
+    clause_quote = quote.replace(", ", ",\n", 1) if "\n" not in quote else quote
 
     chosen = None
-    for size in range(92, 47, -4):
+    for size in range(FONT_MAX, FONT_MIN - 1, -2):
         font = load_font(font_path, size)
-        lines = wrap_lines(quote, font, max_width)
-        line_h = int(size * 1.65)
-        total_h = line_h * len(lines)
-        if len(lines) <= 8 and total_h <= 900:
-            chosen = (font, lines, line_h, total_h)
+        for text in (clause_quote, quote):
+            lines = wrap_lines(text, font, TEXT_WIDTH)
+            if len(lines) <= 3:
+                chosen = (size, font, lines)
+                break
+        if chosen:
             break
-    if chosen is None:  # very long quote: use the smallest size anyway
-        font = load_font(font_path, 48)
-        lines = wrap_lines(quote, font, max_width)
-        line_h = int(48 * 1.65)
-        chosen = (font, lines, line_h, line_h * len(lines))
+    if chosen is None:  # very long quote: smallest size, any number of lines
+        font = load_font(font_path, FONT_MIN)
+        chosen = (FONT_MIN, font, wrap_lines(quote, font, TEXT_WIDTH))
 
-    font, lines, line_h, total_h = chosen
-    top = int(H * 0.46 - total_h / 2)
+    size, font, lines = chosen
+    line_h = int(size * 1.45)
+    moon_r = int(size * 0.42)
+    moon_gap = int(size * 0.35)
+    top = int(H * TOP_Y)
 
-    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    text_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sdraw = ImageDraw.Draw(shadow)
-    tdraw = ImageDraw.Draw(text_layer)
+    # x position of every line (the last one leaves room for the moon)
+    positions = []
+    for i, line in enumerate(lines):
+        width = font.getlength(line)
+        if MOON and i == len(lines) - 1:
+            width += moon_gap + 2 * moon_r
+        positions.append((W - width) / 2)
 
-    y = top
-    for line in lines:
-        x = (W - font.getlength(line)) / 2
-        sdraw.text((x + 3, y + 5), line, font=font, fill=(0, 0, 0, 200))
-        tdraw.text((x, y), line, font=font, fill=(255, 255, 255, 245))
-        y += line_h
+    total_h = line_h * len(lines)
+    x0 = max(0, int(min(positions)) - 40)
+    x1 = min(W, int(max(p + font.getlength(l) for p, l in zip(positions, lines))) + 120)
+    bbox = (x0, max(0, top - 30), x1, top + total_h + 30)
 
-    # thin decorative lines above and below the quote
-    for ly in (top - 70, top + total_h + 40):
-        sdraw.rectangle([W // 2 - 60, ly, W // 2 + 60, ly + 2],
-                        fill=(0, 0, 0, 160))
-        tdraw.rectangle([W // 2 - 60, ly, W // 2 + 60, ly + 2],
-                        fill=(255, 255, 255, 170))
+    return {
+        "font": font, "lines": lines, "size": size, "line_h": line_h,
+        "top": top, "positions": positions, "bbox": bbox,
+        "moon_r": moon_r, "moon_gap": moon_gap,
+    }
 
-    shadow = shadow.filter(ImageFilter.GaussianBlur(9))
-    final = Image.alpha_composite(shadow, text_layer)
-    final.save(out_path)
-    return len(lines)
+
+def moon_mask(radius):
+    """Crescent shape as a smooth (supersampled) mask."""
+    s = 4
+    size = int(2 * radius * s) + 8 * s
+    c = size / 2
+    r = radius * s
+
+    full = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(full).ellipse([c - r, c - r, c + r, c + r], fill=255)
+
+    cut = Image.new("L", (size, size), 0)
+    r2 = r * 0.82
+    cx, cy = c + r * 0.45, c - r * 0.28
+    ImageDraw.Draw(cut).ellipse([cx - r2, cy - r2, cx + r2, cy + r2], fill=255)
+
+    mask = ImageChops.subtract(full, cut)
+    return mask.resize((size // s, size // s), Image.LANCZOS)
+
+
+def make_text_png(layout, luma, out_path):
+    """Draws the quote on a transparent 1080x1920 image.
+
+    Bright footage gets dark text; dark footage gets white text.
+    """
+    dark_text = luma > 150
+    font, lines = layout["font"], layout["lines"]
+
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    if not dark_text:
+        # soft shade at the top so white text stays readable on any footage
+        grad = ImageOps.invert(Image.linear_gradient("L")).resize((W, int(H * 0.38)))
+        grad = grad.point(lambda v: int(v * 85 / 255))
+        band = Image.new("RGBA", grad.size, (0, 0, 0, 0))
+        band.putalpha(grad)
+        canvas.alpha_composite(band, (0, 0))
+
+    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    text = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    hdraw, tdraw = ImageDraw.Draw(halo), ImageDraw.Draw(text)
+
+    if dark_text:
+        fill, halo_fill, offset, blur = (22, 28, 42, 255), (255, 255, 255, 150), (0, 0), 9
+    else:
+        fill, halo_fill, offset, blur = (255, 255, 255, 250), (0, 0, 0, 190), (2, 4), 8
+
+    y = layout["top"]
+    last_end = (0, 0)
+    for line, x in zip(lines, layout["positions"]):
+        hdraw.text((x + offset[0], y + offset[1]), line, font=font, fill=halo_fill)
+        tdraw.text((x, y), line, font=font, fill=fill)
+        last_end = (x + font.getlength(line), y)
+        y += layout["line_h"]
+
+    halo = halo.filter(ImageFilter.GaussianBlur(blur))
+
+    if MOON:
+        r = layout["moon_r"]
+        mask = moon_mask(r)
+        mx = int(last_end[0] + layout["moon_gap"])
+        my = int(last_end[1] + layout["size"] * 0.78 - mask.size[1] / 2)
+        solid = Image.new("RGBA", mask.size, MOON_COLOR + (255,))
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        glow.paste(Image.new("RGBA", mask.size, MOON_COLOR + (120,)), (mx, my), mask)
+        glow = glow.filter(ImageFilter.GaussianBlur(10))
+        halo = Image.alpha_composite(halo, glow)
+        text.paste(solid, (mx, my), mask)
+
+    canvas = Image.alpha_composite(canvas, halo)
+    canvas = Image.alpha_composite(canvas, text)
+    canvas.save(out_path)
 
 
 # --------------------------------------------------------------------------
@@ -138,30 +220,68 @@ def download(url, path):
         raise RuntimeError("Downloaded background is too small (%d bytes)" % size)
 
 
-def make_video(bg_path, text_png, out_path, duration=DURATION):
-    fade_out_at = duration - 1.0
-    text_out_at = duration - 1.8
+def probe_duration(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", path],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return float(out)
 
+
+def plan_speed(source_duration):
+    """Slow-motion factor so the footage fills DURATION seconds."""
+    factor = max(MIN_SLOW, DURATION / source_duration)
+    used = min(source_duration, DURATION / factor)
+    return factor, used
+
+
+def sample_luma(bg_path, bbox, used):
+    """Average brightness (0-255) of the area behind the text."""
+    values = []
+    for i, frac in enumerate((0.1, 0.5, 0.9)):
+        frame = os.path.join(WORK, "luma_%d.png" % i)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", "%.2f" % (used * frac), "-i", bg_path, "-frames:v", "1",
+                 "-vf", "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d"
+                        % (W, H, W, H), frame],
+                check=True,
+            )
+            region = Image.open(frame).convert("L").crop(bbox)
+            values.append(ImageStat.Stat(region).mean[0])
+        except (subprocess.CalledProcessError, OSError):
+            continue
+    return sum(values) / len(values) if values else 80.0
+
+
+def make_video(bg_path, text_png, out_path, factor, used, crf=21):
     filter_complex = (
-        "[0:v]scale=%d:%d:force_original_aspect_ratio=increase,"
-        "crop=%d:%d,setsar=1,fps=%d,"
-        "eq=brightness=-0.12:contrast=1.06:saturation=0.85,"
-        "vignette=PI/5,"
-        "fade=t=in:st=0:d=0.8,fade=t=out:st=%.2f:d=1.0[v];"
+        # footage: crop to 9:16, slow down, smooth the motion, gentle grade
+        "[0:v]scale=%(w)d:%(h)d:force_original_aspect_ratio=increase,"
+        "crop=%(w)d:%(h)d,setsar=1,"
+        "setpts=%(f).4f*PTS,"
+        "minterpolate=fps=%(fps)d:mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=hexbs:vsbmc=0,"
+        "tpad=stop_mode=clone:stop_duration=2,"
+        "eq=brightness=-0.03:contrast=1.04:saturation=1.05,"
+        "vignette=PI/7,"
+        "fade=t=in:st=0:d=1.0,fade=t=out:st=%(fo).2f:d=1.5[v];"
+        # text: fades in, drifts up a little, fades out before the end
         "[1:v]format=rgba,"
-        "fade=t=in:st=1.0:d=1.2:alpha=1,"
-        "fade=t=out:st=%.2f:d=1.0:alpha=1[t];"
-        "[v][t]overlay=0:0:format=auto,format=yuv420p[out]"
-    ) % (W, H, W, H, FPS, fade_out_at, text_out_at)
+        "fade=t=in:st=1.5:d=1.5:alpha=1,"
+        "fade=t=out:st=%(to).2f:d=1.2:alpha=1[t];"
+        "[v][t]overlay=x=0:y='14-5*min(t\\,3)':format=auto,format=yuv420p[out]"
+    ) % {"w": W, "h": H, "f": factor, "fps": FPS,
+         "fo": DURATION - 1.5, "to": DURATION - 3.0}
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-stream_loop", "-1", "-i", bg_path,
+        "-t", "%.3f" % used, "-i", bg_path,
         "-loop", "1", "-framerate", str(FPS), "-i", text_png,
-        "-t", str(duration),
         "-filter_complex", filter_complex,
-        "-map", "[out]", "-an",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-map", "[out]", "-an", "-t", str(DURATION),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
         "-movflags", "+faststart",
         out_path,
     ]
@@ -211,7 +331,7 @@ def send_to_telegram(token, chat_id, video_path, content_id, quote, caption, son
                 "reply_markup": json.dumps(keyboard),
             },
             files={"video": ("adhuro_katha.mp4", f, "video/mp4")},
-            timeout=180,
+            timeout=240,
         )
 
     data = r.json()
@@ -237,6 +357,33 @@ def report(url, secret, payload):
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+
+def build_video(bg_url, quote, bg_path, text_png, out_path):
+    print("Downloading background...")
+    download(bg_url, bg_path)
+
+    source_duration = probe_duration(bg_path)
+    factor, used = plan_speed(source_duration)
+    print("Source %.1fs -> slow-motion x%.2f (uses %.1fs)"
+          % (source_duration, factor, used))
+
+    layout = layout_text(quote)
+    print("Text: size %d, %d lines" % (layout["size"], len(layout["lines"])))
+
+    luma = sample_luma(bg_path, layout["bbox"], used)
+    print("Brightness behind text: %.0f -> %s text"
+          % (luma, "dark" if luma > 150 else "white"))
+    make_text_png(layout, luma, text_png)
+
+    print("Rendering video (this takes a few minutes)...")
+    make_video(bg_path, text_png, out_path, factor, used)
+
+    size = os.path.getsize(out_path)
+    if size > 45_000_000:  # Telegram bots can send up to 50 MB
+        print("File too big (%.1f MB), re-encoding smaller..." % (size / 1e6))
+        make_video(bg_path, text_png, out_path, factor, used, crf=27)
+    print("Video size: %.1f MB" % (os.path.getsize(out_path) / 1e6))
+
 
 def main():
     e = os.environ.get
@@ -264,16 +411,7 @@ def main():
         text_png = os.path.join(WORK, "text.png")
         out_path = os.path.join(WORK, "final.mp4")
 
-        print("Downloading background...")
-        download(bg_url, bg_path)
-
-        print("Drawing text...")
-        n = make_text_png(quote, text_png)
-        print("Quote lines:", n)
-
-        print("Rendering video...")
-        make_video(bg_path, text_png, out_path)
-        print("Video size: %.1f MB" % (os.path.getsize(out_path) / 1e6))
+        build_video(bg_url, quote, bg_path, text_png, out_path)
 
         print("Sending to Telegram...")
         file_id = send_to_telegram(
