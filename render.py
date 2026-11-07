@@ -308,13 +308,15 @@ def scrub(text, secrets):
     return text
 
 
-def send_to_telegram(token, chat_id, video_path, content_id, quote, caption, song):
+def send_to_telegram(token, chat_id, video_path, content_id, quote, caption, song,
+                     scheduled=""):
     text = (
         "🥀 " + quote + "\n\n"
         "🖤 " + caption + "\n\n"
         "🎵 " + (song or "-") + "\n\n"
         + HASHTAGS + "\n\n"
-        "🆔 " + content_id
+        + ("⏰ Scheduled: " + scheduled + "\n\n" if scheduled else "")
+        + "🆔 " + content_id
     )[:1000]
 
     keyboard = {
@@ -404,6 +406,7 @@ def main():
     quote = e("QUOTE", "")
     caption = e("CAPTION", "")
     song = e("SONG", "")
+    scheduled = e("SCHEDULED", "")
     bg_url = e("BACKGROUND_URL", "")
     token = e("TELEGRAM_BOT_TOKEN", "")
     chat_id = e("OWNER_CHAT_ID", "")
@@ -428,7 +431,7 @@ def main():
 
         print("Sending to Telegram...")
         file_id = send_to_telegram(
-            token, chat_id, out_path, content_id, quote, caption, song
+            token, chat_id, out_path, content_id, quote, caption, song, scheduled
         )
 
         if apps_url and secret:

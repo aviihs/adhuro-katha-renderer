@@ -24,6 +24,10 @@ on:
         description: "Background source page"
         required: false
         default: ""
+      scheduled_time:
+        description: "Posting slot label"
+        required: false
+        default: ""
 
 concurrency:
   group: render
@@ -57,6 +61,7 @@ jobs:
           CAPTION: ${{ inputs.caption }}
           SONG: ${{ inputs.song }}
           BACKGROUND_URL: ${{ inputs.background_url }}
+          SCHEDULED: ${{ inputs.scheduled_time }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
