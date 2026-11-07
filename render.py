@@ -23,6 +23,8 @@ W, H = 1080, 1920
 FPS = 30
 DURATION = 20          # final video length in seconds
 MIN_SLOW = 1.5         # footage is always slowed down at least this much
+# "smooth" = best motion, slower (a few minutes); "fast" = blended frames, ~seconds
+SLOWMO = os.environ.get("SLOWMO", "smooth").strip().lower()
 WORK = "work"
 HASHTAGS = "#अधुरोकथा #Loneliness #NepaliSadQuotes #DeepFeelings #BrokenHeart"
 UA = {"User-Agent": "Mozilla/5.0 (AdhuroKathaRenderer)"}
@@ -256,13 +258,20 @@ def sample_luma(bg_path, bbox, used):
     return sum(values) / len(values) if values else 80.0
 
 
+def interp_filter():
+    if SLOWMO == "fast":
+        return "minterpolate=fps=%d:mi_mode=blend" % FPS
+    return ("minterpolate=fps=%d:mi_mode=mci:mc_mode=obmc:me_mode=bilat:"
+            "me=hexbs:vsbmc=0" % FPS)
+
+
 def make_video(bg_path, text_png, out_path, factor, used, crf=21):
     filter_complex = (
         # footage: crop to 9:16, slow down, smooth the motion, gentle grade
         "[0:v]scale=%(w)d:%(h)d:force_original_aspect_ratio=increase,"
         "crop=%(w)d:%(h)d,setsar=1,"
         "setpts=%(f).4f*PTS,"
-        "minterpolate=fps=%(fps)d:mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=hexbs:vsbmc=0,"
+        "%(interp)s,"
         "tpad=stop_mode=clone:stop_duration=2,"
         "eq=brightness=-0.03:contrast=1.04:saturation=1.05,"
         "vignette=PI/7,"
@@ -272,7 +281,7 @@ def make_video(bg_path, text_png, out_path, factor, used, crf=21):
         "fade=t=in:st=1.5:d=1.5:alpha=1,"
         "fade=t=out:st=%(to).2f:d=1.2:alpha=1[t];"
         "[v][t]overlay=x=0:y='14-5*min(t\\,3)':format=auto,format=yuv420p[out]"
-    ) % {"w": W, "h": H, "f": factor, "fps": FPS,
+    ) % {"w": W, "h": H, "f": factor, "fps": FPS, "interp": interp_filter(),
          "fo": DURATION - 1.5, "to": DURATION - 3.0}
 
     cmd = [
@@ -359,8 +368,10 @@ def report(url, secret, payload):
 # --------------------------------------------------------------------------
 
 def build_video(bg_url, quote, bg_path, text_png, out_path):
-    print("Downloading background...")
+    t0 = time.time()
+    print("Downloading background... (slow-mo mode: %s)" % SLOWMO)
     download(bg_url, bg_path)
+    print("  download took %.0fs" % (time.time() - t0))
 
     source_duration = probe_duration(bg_path)
     factor, used = plan_speed(source_duration)
@@ -375,8 +386,10 @@ def build_video(bg_url, quote, bg_path, text_png, out_path):
           % (luma, "dark" if luma > 150 else "white"))
     make_text_png(layout, luma, text_png)
 
-    print("Rendering video (this takes a few minutes)...")
+    t1 = time.time()
+    print("Rendering video...")
     make_video(bg_path, text_png, out_path, factor, used)
+    print("  render took %.0fs" % (time.time() - t1))
 
     size = os.path.getsize(out_path)
     if size > 45_000_000:  # Telegram bots can send up to 50 MB

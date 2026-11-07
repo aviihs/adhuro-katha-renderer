@@ -39,11 +39,12 @@ jobs:
       - name: Install ffmpeg and fonts
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-noto-core libraqm0 libfribidi0
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-noto-core libraqm0 libfribidi0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install Python packages
         run: pip install -r requirements.txt
@@ -60,4 +61,6 @@ jobs:
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
           RENDER_SECRET: ${{ secrets.RENDER_SECRET }}
+          # Optional repo variable: set SLOWMO=fast for quick (blended) slow-motion
+          SLOWMO: ${{ vars.SLOWMO || 'smooth' }}
         run: python render.py
